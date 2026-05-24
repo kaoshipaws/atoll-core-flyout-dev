@@ -27,6 +27,7 @@ namespace DesktopFlyouts
     public unsafe partial class SystemTrayIcon : IDisposable
     {
         private const uint WM_UNIQUE_MESSAGE = 2048U;
+        private const uint FALLBACK_UID = 1u;
 
         private readonly static string TrayIconWindowClassName = $"SystemTrayIconClass_{Guid.NewGuid():B}";
 
@@ -36,6 +37,7 @@ namespace DesktopFlyouts
 
         private bool _created;
         private bool _disposed;
+        private bool _useGuid = true;
         private HICON _hIcon;
 
         /// <summary>
@@ -272,8 +274,8 @@ namespace DesktopFlyouts
                 NOTIFYICONDATAW data = default;
                 data.cbSize = (uint)sizeof(NOTIFYICONDATAW);
                 data.hWnd = _hWnd;
-                data.guidItem = Id;
-                data.uFlags = NOTIFY_ICON_DATA_FLAGS.NIF_MESSAGE | NOTIFY_ICON_DATA_FLAGS.NIF_ICON | NOTIFY_ICON_DATA_FLAGS.NIF_TIP | NOTIFY_ICON_DATA_FLAGS.NIF_GUID | NOTIFY_ICON_DATA_FLAGS.NIF_SHOWTIP;
+                data.uFlags = NOTIFY_ICON_DATA_FLAGS.NIF_MESSAGE | NOTIFY_ICON_DATA_FLAGS.NIF_ICON | NOTIFY_ICON_DATA_FLAGS.NIF_TIP | NOTIFY_ICON_DATA_FLAGS.NIF_SHOWTIP;
+                ApplyIdentity(ref data);
 
                 PInvoke.Shell_NotifyIcon(NOTIFY_ICON_MESSAGE.NIM_DELETE, &data);
 
@@ -289,7 +291,21 @@ namespace DesktopFlyouts
             {
                 NOTIFYICONDATAW data = GetNotifyIconData();
                 PInvoke.Shell_NotifyIcon(NOTIFY_ICON_MESSAGE.NIM_DELETE, &data);
-                if (PInvoke.Shell_NotifyIcon(NOTIFY_ICON_MESSAGE.NIM_ADD, &data))
+                bool added = PInvoke.Shell_NotifyIcon(NOTIFY_ICON_MESSAGE.NIM_ADD, &data);
+
+                // NIM_ADD with NIF_GUID requires the app to be installed via a setup package
+                // (Explorer keeps a registry whitelist by GUID). For unpackaged / dev builds it
+                // silently fails. When that happens we retry with a numeric uID for the rest of
+                // this instance's lifetime.
+                if (!added && _useGuid)
+                {
+                    _useGuid = false;
+                    data = GetNotifyIconData();
+                    PInvoke.Shell_NotifyIcon(NOTIFY_ICON_MESSAGE.NIM_DELETE, &data);
+                    added = PInvoke.Shell_NotifyIcon(NOTIFY_ICON_MESSAGE.NIM_ADD, &data);
+                }
+
+                if (added)
                 {
                     data.Anonymous.uVersion = 4u;
                     PInvoke.Shell_NotifyIcon(NOTIFY_ICON_MESSAGE.NIM_SETVERSION, &data);
@@ -322,10 +338,10 @@ namespace DesktopFlyouts
             data.hWnd = _hWnd;
             data.uCallbackMessage = WM_UNIQUE_MESSAGE;
             data.hIcon = _hIcon;
-            data.guidItem = Id;
             data.szTip = Tooltip ?? string.Empty;
             data.dwState = _IsVisible ? 0U : NOTIFY_ICON_STATE.NIS_HIDDEN;
-            data.uFlags = NOTIFY_ICON_DATA_FLAGS.NIF_MESSAGE | NOTIFY_ICON_DATA_FLAGS.NIF_ICON | NOTIFY_ICON_DATA_FLAGS.NIF_TIP | NOTIFY_ICON_DATA_FLAGS.NIF_STATE | NOTIFY_ICON_DATA_FLAGS.NIF_GUID | NOTIFY_ICON_DATA_FLAGS.NIF_SHOWTIP;
+            data.uFlags = NOTIFY_ICON_DATA_FLAGS.NIF_MESSAGE | NOTIFY_ICON_DATA_FLAGS.NIF_ICON | NOTIFY_ICON_DATA_FLAGS.NIF_TIP | NOTIFY_ICON_DATA_FLAGS.NIF_STATE | NOTIFY_ICON_DATA_FLAGS.NIF_SHOWTIP;
+            ApplyIdentity(ref data);
             return data;
         }
 
@@ -361,12 +377,28 @@ namespace DesktopFlyouts
             _hIcon = default;
         }
 
+        private void ApplyIdentity(ref NOTIFYICONDATAW data)
+        {
+            if (_useGuid)
+            {
+                data.guidItem = Id;
+                data.uFlags |= NOTIFY_ICON_DATA_FLAGS.NIF_GUID;
+            }
+            else
+            {
+                data.uID = FALLBACK_UID;
+            }
+        }
+
         private Point GetCenterPointOfTrayIcon(HWND hWnd)
         {
             NOTIFYICONIDENTIFIER nii = default;
             nii.cbSize = (uint)sizeof(NOTIFYICONIDENTIFIER);
             nii.hWnd = hWnd;
-            nii.guidItem = Id;
+            if (_useGuid)
+                nii.guidItem = Id;
+            else
+                nii.uID = FALLBACK_UID;
 
             RECT rect = default;
             Point point = default;

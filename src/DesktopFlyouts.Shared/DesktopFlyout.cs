@@ -824,6 +824,151 @@ namespace DesktopFlyouts
 #endif
         }
 
+        private DesktopFlyoutPopupDirection UpdateFlyoutRegion()
+        {
+            if (_host?.DesktopWindowXamlSource is null || IslandsGrid is null)
+                return ResolvePopupDirection(PopupDirection, default, WindowHelpers.GetFlyoutWorkAreaRect(_customPlacementBottomCenterPoint), null);
+
+            var customBottomCenterPoint = _customPlacementBottomCenterPoint;
+            var scale = _host.XamlIslandRasterizationScale;
+            var flyoutWidth = GetCurrentFlyoutWidth();
+            var flyoutHeight = GetCurrentFlyoutHeight();
+            var scaledFlyoutSize = new FoundationSize(flyoutWidth * scale, flyoutHeight * scale);
+            var scaledMargin = GetScaledMargin(Margin, scale);
+            var frameWidth = scaledFlyoutSize.Width + scaledMargin.Left + scaledMargin.Right;
+            var frameHeight = scaledFlyoutSize.Height + scaledMargin.Top + scaledMargin.Bottom;
+            var workArea = WindowHelpers.GetFlyoutWorkAreaRect(customBottomCenterPoint);
+            var hostWidth = workArea.Width;
+            var hostHeight = workArea.Height;
+            var regionWidth = Math.Max(1, (int)Math.Ceiling(Math.Min(frameWidth, hostWidth)));
+            var regionHeight = Math.Max(1, (int)Math.Ceiling(Math.Min(frameHeight, hostHeight)));
+            var requestedPopupDirection = PopupDirection;
+            _customPlacementBottomCenterPoint = null;
+
+            double left;
+            double top;
+            TaskbarEdge? detectedEdge = null;
+
+            if (customBottomCenterPoint is Point bottomCenterPoint)
+            {
+                (left, top) = GetCustomPlacementOrigin(
+                    bottomCenterPoint, regionWidth, regionHeight,
+                    scaledFlyoutSize, scaledMargin, workArea,
+                    out detectedEdge);
+            }
+            else
+            {
+                (left, top) = GetPlacementOrigin(Placement, regionWidth, regionHeight, workArea);
+            }
+
+            left = Clamp(left, workArea.Left, workArea.Right - regionWidth);
+            top = Clamp(top, workArea.Top, workArea.Bottom - regionHeight);
+
+            var region = new RectInt32(
+                (int)Math.Round(left),
+                (int)Math.Round(top),
+                (int)regionWidth,
+                (int)regionHeight);
+
+            _host.MoveAndResize(region, ShouldActivateOnOpen());
+            _host.SetHWndRectRegion(new(0, 0, region.Width, region.Height));
+
+            return ResolvePopupDirection(requestedPopupDirection, region, workArea, detectedEdge);
+        }
+
+        internal void OnIslandSizeChanged()
+        {
+            UpdateIslands();
+            UpdateOpenFlyoutLayout();
+        }
+
+        private void UpdateOpenFlyoutLayout()
+        {
+            if (!IsOpen || _isPopupAnimationPlaying || RootGrid is null || _host?.DesktopWindowXamlSource is null)
+                return;
+
+            ResetResolvedFlyoutSize();
+            UpdateLayout();
+            ApplyResolvedFlyoutSize();
+            UpdateLayout();
+            _activePopupDirection = UpdateFlyoutRegion();
+            SetOpenTransform();
+        }
+
+        private void ResetResolvedFlyoutSize()
+        {
+            if (RootGrid is null)
+                return;
+
+            RootGrid.Width = double.NaN;
+            RootGrid.Height = double.NaN;
+        }
+
+        private void ApplyResolvedFlyoutSize()
+        {
+            if (RootGrid is null || _host is null)
+                return;
+
+            var (availableWidth, availableHeight) = GetAvailableFlyoutSizeInDips();
+            RootGrid.Width = ResolveFlyoutLength(FlyoutWidth, availableWidth, HasStarIslandWidth());
+            RootGrid.Height = ResolveFlyoutLength(FlyoutHeight, availableHeight, HasStarIslandHeight());
+        }
+
+        private (double Width, double Height) GetAvailableFlyoutSizeInDips()
+        {
+            if (_host is null)
+                return (0, 0);
+
+            var scale = _host.XamlIslandRasterizationScale;
+            var workArea = WindowHelpers.GetFlyoutWorkAreaRect(_customPlacementBottomCenterPoint);
+            var availableWidth = (workArea.Width / scale) - Margin.Left - Margin.Right;
+            var availableHeight = (workArea.Height / scale) - Margin.Top - Margin.Bottom;
+
+            return (Math.Max(0, availableWidth), Math.Max(0, availableHeight));
+        }
+
+        private bool HasStarIslandWidth()
+        {
+            foreach (var item in Islands)
+            {
+                if (item is DesktopFlyoutIsland island && island.IslandWidth.IsStar)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool HasStarIslandHeight()
+        {
+            foreach (var item in Islands)
+            {
+                if (item is DesktopFlyoutIsland island && island.IslandHeight.IsStar)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private void OpenAnimationStoryboard_Completed(object? sender, object e)
+        {
+            if (sender is not Storyboard storyboard)
+                return;
+
+            storyboard.Completed -= OpenAnimationStoryboard_Completed;
+            storyboard.Stop();
+            CompleteOpen();
+        }
+
+        private void CloseAnimationStoryboard_Completed(object? sender, object e)
+        {
+            if (sender is not Storyboard storyboard)
+                return;
+
+            storyboard.Completed -= CloseAnimationStoryboard_Completed;
+            storyboard.Stop();
+            CompleteClose();
+        }
+
         private void CompleteOpen()
         {
             StopSwipeDismissRestoreStoryboard();
@@ -1767,10 +1912,12 @@ namespace DesktopFlyouts
             int regionHeight,
             FoundationSize flyoutSize,
             Thickness scaledMargin,
-            Rectangle workArea)
+            Rectangle workArea,
+            out TaskbarEdge? detectedEdge)
         {
             if (WindowHelpers.TryGetTaskbarInfoForPoint(point, out _, out var taskbarEdge))
             {
+                detectedEdge = taskbarEdge;
                 return taskbarEdge switch
                 {
                     TaskbarEdge.Left => (workArea.Left, point.Y - (regionHeight / 2D)),
@@ -1780,6 +1927,7 @@ namespace DesktopFlyouts
                 };
             }
 
+            detectedEdge = null;
             return (
                 point.X - (flyoutSize.Width / 2D) - scaledMargin.Left,
                 point.Y - flyoutSize.Height - scaledMargin.Top);
@@ -1801,14 +1949,30 @@ namespace DesktopFlyouts
             };
         }
 
-        private static DesktopFlyoutPopupDirection ResolvePopupDirection(DesktopFlyoutPopupDirection requestedDirection, RectInt32 region, Rectangle workArea)
+        private static DesktopFlyoutPopupDirection ResolvePopupDirection(DesktopFlyoutPopupDirection requestedDirection, RectInt32 region, Rectangle workArea, TaskbarEdge? detectedEdge)
         {
+            // Explicit direction always wins.
+            if (requestedDirection is DesktopFlyoutPopupDirection.BottomToTop
+                or DesktopFlyoutPopupDirection.TopToBottom
+                or DesktopFlyoutPopupDirection.LeftToRight
+                or DesktopFlyoutPopupDirection.RightToLeft)
+                return requestedDirection;
+
+            // When showing from a tray icon point, derive direction directly from the taskbar edge
+            // so the flyout slides in from the correct side regardless of the auto-mode setting.
+            if (detectedEdge is TaskbarEdge edge)
+            {
+                return edge switch
+                {
+                    TaskbarEdge.Bottom => DesktopFlyoutPopupDirection.BottomToTop,
+                    TaskbarEdge.Top    => DesktopFlyoutPopupDirection.TopToBottom,
+                    TaskbarEdge.Left   => DesktopFlyoutPopupDirection.LeftToRight,
+                    _                  => DesktopFlyoutPopupDirection.RightToLeft,
+                };
+            }
+
             return requestedDirection switch
             {
-                DesktopFlyoutPopupDirection.BottomToTop => DesktopFlyoutPopupDirection.BottomToTop,
-                DesktopFlyoutPopupDirection.TopToBottom => DesktopFlyoutPopupDirection.TopToBottom,
-                DesktopFlyoutPopupDirection.LeftToRight => DesktopFlyoutPopupDirection.LeftToRight,
-                DesktopFlyoutPopupDirection.RightToLeft => DesktopFlyoutPopupDirection.RightToLeft,
                 DesktopFlyoutPopupDirection.Horizontal => IsRightHalf(region, workArea) ? DesktopFlyoutPopupDirection.RightToLeft : DesktopFlyoutPopupDirection.LeftToRight,
                 _ => IsBottomHalf(region, workArea) ? DesktopFlyoutPopupDirection.BottomToTop : DesktopFlyoutPopupDirection.TopToBottom,
             };
