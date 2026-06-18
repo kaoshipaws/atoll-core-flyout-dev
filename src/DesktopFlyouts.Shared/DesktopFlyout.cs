@@ -68,6 +68,7 @@ namespace DesktopFlyouts
         private int _pendingTransitionStoryboardCount;
         private int _restoreActivationTickCount;
         private Point? _customPlacementBottomCenterPoint;
+        private Point? _lastAnchorPoint;
         private DesktopFlyoutIsland? _capturedPointerIsland;
         private DesktopFlyoutIsland? _swipeDismissIsland;
         private DesktopFlyoutIsland? _swipeDismissRestoreIsland;
@@ -108,6 +109,11 @@ namespace DesktopFlyouts
                 return;
             }
 
+            // If Show() was called without a point, forget the previous anchor
+            // so subsequent layout updates use Placement rather than a stale point.
+            if (_customPlacementBottomCenterPoint is null)
+                _lastAnchorPoint = null;
+
             StopAutoCloseTimer();
             StopRestoreActivationTimer();
             StopLostFocusCloseTimer();
@@ -143,6 +149,7 @@ namespace DesktopFlyouts
                 return;
 
             _customPlacementBottomCenterPoint = bottomCenterPoint;
+            _lastAnchorPoint = bottomCenterPoint;
             Show();
         }
 
@@ -312,6 +319,7 @@ namespace DesktopFlyouts
             StopSwipeDismissRestoreStoryboard();
             ReleaseCapturedPointers();
             ResetSwipeDismissTracking();
+            _lastAnchorPoint = null;
 
             if (_disposed || _isPopupAnimationPlaying)
                 return;
@@ -450,9 +458,9 @@ namespace DesktopFlyouts
         private DesktopFlyoutPopupDirection UpdateFlyoutRegion()
         {
             if (_islandHosts.Count == 0)
-                return ResolvePopupDirection(PopupDirection, default, WindowHelpers.GetFlyoutWorkAreaRect(_customPlacementBottomCenterPoint));
+                return ResolvePopupDirection(PopupDirection, default, WindowHelpers.GetFlyoutWorkAreaRect(_customPlacementBottomCenterPoint), null);
 
-            var customBottomCenterPoint = _customPlacementBottomCenterPoint;
+            var customBottomCenterPoint = _customPlacementBottomCenterPoint ?? _lastAnchorPoint;
             var workArea = WindowHelpers.GetFlyoutWorkAreaRect(customBottomCenterPoint);
             UpdateIslandLayoutRects(workArea);
 
@@ -469,6 +477,7 @@ namespace DesktopFlyouts
 
             double left;
             double top;
+            TaskbarEdge? detectedEdge = null;
             if (customBottomCenterPoint is Point bottomCenterPoint)
             {
                 (left, top) = GetCustomPlacementOrigin(
@@ -477,7 +486,8 @@ namespace DesktopFlyouts
                     regionHeight,
                     new(_currentFlyoutWidth * scale, _currentFlyoutHeight * scale),
                     AddThickness(scaledMargin, scaledIslandShadowMargin),
-                    workArea);
+                    workArea,
+                    out detectedEdge);
             }
             else
             {
@@ -518,7 +528,7 @@ namespace DesktopFlyouts
             }
 
             UpdateHostDragRegions();
-            return ResolvePopupDirection(requestedPopupDirection, flyoutRegion, workArea);
+            return ResolvePopupDirection(requestedPopupDirection, flyoutRegion, workArea, detectedEdge);
         }
 
         private void UpdateIslandLayoutRects(Rectangle workArea)
@@ -824,130 +834,6 @@ namespace DesktopFlyouts
 #endif
         }
 
-        private DesktopFlyoutPopupDirection UpdateFlyoutRegion()
-        {
-            if (_host?.DesktopWindowXamlSource is null || IslandsGrid is null)
-                return ResolvePopupDirection(PopupDirection, default, WindowHelpers.GetFlyoutWorkAreaRect(_customPlacementBottomCenterPoint), null);
-
-            var customBottomCenterPoint = _customPlacementBottomCenterPoint;
-            var scale = _host.XamlIslandRasterizationScale;
-            var flyoutWidth = GetCurrentFlyoutWidth();
-            var flyoutHeight = GetCurrentFlyoutHeight();
-            var scaledFlyoutSize = new FoundationSize(flyoutWidth * scale, flyoutHeight * scale);
-            var scaledMargin = GetScaledMargin(Margin, scale);
-            var frameWidth = scaledFlyoutSize.Width + scaledMargin.Left + scaledMargin.Right;
-            var frameHeight = scaledFlyoutSize.Height + scaledMargin.Top + scaledMargin.Bottom;
-            var workArea = WindowHelpers.GetFlyoutWorkAreaRect(customBottomCenterPoint);
-            var hostWidth = workArea.Width;
-            var hostHeight = workArea.Height;
-            var regionWidth = Math.Max(1, (int)Math.Ceiling(Math.Min(frameWidth, hostWidth)));
-            var regionHeight = Math.Max(1, (int)Math.Ceiling(Math.Min(frameHeight, hostHeight)));
-            var requestedPopupDirection = PopupDirection;
-            _customPlacementBottomCenterPoint = null;
-
-            double left;
-            double top;
-            TaskbarEdge? detectedEdge = null;
-
-            if (customBottomCenterPoint is Point bottomCenterPoint)
-            {
-                (left, top) = GetCustomPlacementOrigin(
-                    bottomCenterPoint, regionWidth, regionHeight,
-                    scaledFlyoutSize, scaledMargin, workArea,
-                    out detectedEdge);
-            }
-            else
-            {
-                (left, top) = GetPlacementOrigin(Placement, regionWidth, regionHeight, workArea);
-            }
-
-            left = Clamp(left, workArea.Left, workArea.Right - regionWidth);
-            top = Clamp(top, workArea.Top, workArea.Bottom - regionHeight);
-
-            var region = new RectInt32(
-                (int)Math.Round(left),
-                (int)Math.Round(top),
-                (int)regionWidth,
-                (int)regionHeight);
-
-            _host.MoveAndResize(region, ShouldActivateOnOpen());
-            _host.SetHWndRectRegion(new(0, 0, region.Width, region.Height));
-
-            return ResolvePopupDirection(requestedPopupDirection, region, workArea, detectedEdge);
-        }
-
-        internal void OnIslandSizeChanged()
-        {
-            UpdateIslands();
-            UpdateOpenFlyoutLayout();
-        }
-
-        private void UpdateOpenFlyoutLayout()
-        {
-            if (!IsOpen || _isPopupAnimationPlaying || RootGrid is null || _host?.DesktopWindowXamlSource is null)
-                return;
-
-            ResetResolvedFlyoutSize();
-            UpdateLayout();
-            ApplyResolvedFlyoutSize();
-            UpdateLayout();
-            _activePopupDirection = UpdateFlyoutRegion();
-            SetOpenTransform();
-        }
-
-        private void ResetResolvedFlyoutSize()
-        {
-            if (RootGrid is null)
-                return;
-
-            RootGrid.Width = double.NaN;
-            RootGrid.Height = double.NaN;
-        }
-
-        private void ApplyResolvedFlyoutSize()
-        {
-            if (RootGrid is null || _host is null)
-                return;
-
-            var (availableWidth, availableHeight) = GetAvailableFlyoutSizeInDips();
-            RootGrid.Width = ResolveFlyoutLength(FlyoutWidth, availableWidth, HasStarIslandWidth());
-            RootGrid.Height = ResolveFlyoutLength(FlyoutHeight, availableHeight, HasStarIslandHeight());
-        }
-
-        private (double Width, double Height) GetAvailableFlyoutSizeInDips()
-        {
-            if (_host is null)
-                return (0, 0);
-
-            var scale = _host.XamlIslandRasterizationScale;
-            var workArea = WindowHelpers.GetFlyoutWorkAreaRect(_customPlacementBottomCenterPoint);
-            var availableWidth = (workArea.Width / scale) - Margin.Left - Margin.Right;
-            var availableHeight = (workArea.Height / scale) - Margin.Top - Margin.Bottom;
-
-            return (Math.Max(0, availableWidth), Math.Max(0, availableHeight));
-        }
-
-        private bool HasStarIslandWidth()
-        {
-            foreach (var item in Islands)
-            {
-                if (item is DesktopFlyoutIsland island && island.IslandWidth.IsStar)
-                    return true;
-            }
-
-            return false;
-        }
-
-        private bool HasStarIslandHeight()
-        {
-            foreach (var item in Islands)
-            {
-                if (item is DesktopFlyoutIsland island && island.IslandHeight.IsStar)
-                    return true;
-            }
-
-            return false;
-        }
 
         private void OpenAnimationStoryboard_Completed(object? sender, object e)
         {
