@@ -132,6 +132,7 @@ namespace DesktopFlyouts
         internal event EventHandler? NativeMoveSizeEnded;
 #endif
         internal event EventHandler? SystemSettingsChanged;
+        internal event EventHandler? DpiChanged;
         internal event EventHandler<XamlSourceFocusNavigationRequest>? TakeFocusRequested;
 
         internal XamlIslandHostWindow()
@@ -681,6 +682,11 @@ namespace DesktopFlyouts
                     }
                     break;
 #endif
+                case PInvoke.WM_DPICHANGED:
+                    {
+                        DpiChanged?.Invoke(this, EventArgs.Empty);
+                        return (LRESULT)0;
+                    }
                 case PInvoke.WM_SETTINGCHANGE:
                 case PInvoke.WM_THEMECHANGED:
                     {

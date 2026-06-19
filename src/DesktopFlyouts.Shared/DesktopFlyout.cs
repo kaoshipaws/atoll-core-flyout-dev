@@ -64,6 +64,7 @@ namespace DesktopFlyouts
         private bool _isPointerCaptured;
         private bool _isClosingTransition;
         private bool _isNavigatingFocusAcrossHosts;
+        private bool _isNativeMoveSizing;
         private bool _disposed;
         private int _pendingTransitionStoryboardCount;
         private int _restoreActivationTickCount;
@@ -361,6 +362,7 @@ namespace DesktopFlyouts
                     host.NativeMoveSizeEnded -= HostWindow_NativeMoveSizeEnded;
 #endif
                     host.SystemSettingsChanged -= HostWindow_SystemSettingsChanged;
+                    host.DpiChanged -= HostWindow_DpiChanged;
                     host.TakeFocusRequested -= HostWindow_TakeFocusRequested;
 #if WASDK
                     island.ClearOwnerBackdrop();
@@ -389,6 +391,7 @@ namespace DesktopFlyouts
                 host.NativeMoveSizeEnded += HostWindow_NativeMoveSizeEnded;
 #endif
                 host.SystemSettingsChanged += HostWindow_SystemSettingsChanged;
+                host.DpiChanged += HostWindow_DpiChanged;
                 host.TakeFocusRequested += HostWindow_TakeFocusRequested;
                 _islandHosts[island] = host;
 
@@ -1903,6 +1906,7 @@ namespace DesktopFlyouts
 #if WASDK
         private void HostWindow_NativeMoveSizeStarted(object? sender, EventArgs e)
         {
+            _isNativeMoveSizing = true;
             StopAutoCloseTimer();
             ReleaseCapturedPointers();
             ResetSwipeDismissTracking();
@@ -1911,9 +1915,14 @@ namespace DesktopFlyouts
 
         private void HostWindow_NativeMoveSizeEnded(object? sender, EventArgs e)
         {
+            _isNativeMoveSizing = false;
             if (IsOpen && !_isPopupAnimationPlaying)
             {
-                UpdateHostDragRegions();
+                // Update the anchor point to the current window bottom-center so that
+                // subsequent layout updates (e.g. IslandHeight changes) keep the flyout
+                // at its dragged position rather than snapping to Placement (BottomRight).
+                _lastAnchorPoint = GetCurrentWindowBottomCenter();
+                UpdateOpenFlyoutLayout();
                 RestartAutoCloseTimer();
             }
         }
@@ -1926,6 +1935,40 @@ namespace DesktopFlyouts
 
             UpdateFlyoutTheme();
             UpdateIslandBackdrops();
+        }
+
+        private void HostWindow_DpiChanged(object? sender, EventArgs e)
+        {
+            if (_disposed)
+                return;
+
+            // Skip layout update during native drag — the anchor point is stale.
+            // NativeMoveSizeEnded will update the anchor and re-layout after drag completes.
+            if (!_isNativeMoveSizing)
+            {
+                UpdateOpenFlyoutLayout();
+                OnDpiChanged();
+            }
+        }
+
+        protected virtual void OnDpiChanged()
+        {
+        }
+
+        protected System.Drawing.Rectangle GetFlyoutWorkAreaRect()
+            => WindowHelpers.GetFlyoutWorkAreaRect(_customPlacementBottomCenterPoint ?? _lastAnchorPoint);
+
+        private Point? GetCurrentWindowBottomCenter()
+        {
+            foreach (var host in _islandHosts.Values)
+            {
+                var windowSize = host.ContentWindowSize;
+                return new Point(
+                    (int)(windowSize.X + windowSize.Width / 2),
+                    (int)(windowSize.Y + windowSize.Height));
+            }
+
+            return null;
         }
 
         private void HostWindow_TakeFocusRequested(object? sender, XamlSourceFocusNavigationRequest request)
@@ -1996,6 +2039,7 @@ namespace DesktopFlyouts
                 item.Value.NativeMoveSizeEnded -= HostWindow_NativeMoveSizeEnded;
 #endif
                 item.Value.SystemSettingsChanged -= HostWindow_SystemSettingsChanged;
+                item.Value.DpiChanged -= HostWindow_DpiChanged;
                 item.Value.TakeFocusRequested -= HostWindow_TakeFocusRequested;
 #if WASDK
                 item.Key.ClearOwnerBackdrop();
