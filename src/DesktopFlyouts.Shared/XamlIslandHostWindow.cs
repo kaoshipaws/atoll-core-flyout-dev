@@ -216,12 +216,14 @@ namespace DesktopFlyouts
                 PInvoke.SetFocus(_preservedFocusHWnd);
         }
 
-        internal void MoveAndResize(RectInt32 rect, bool activate = true)
+        internal void MoveAndResize(RectInt32 rect, bool activate = true, bool async = false)
         {
             if (_disposed)
                 return;
 
             var flags = activate ? 0 : SET_WINDOW_POS_FLAGS.SWP_NOACTIVATE;
+            if (async)
+                flags |= SET_WINDOW_POS_FLAGS.SWP_ASYNCWINDOWPOS;
             PInvoke.SetWindowPos(HWnd, HWND.HWND_TOP, rect.X, rect.Y, rect.Width, rect.Height, flags);
             PInvoke.SetWindowPos(_xamlHwnd, HWND.HWND_TOP, 0, 0, rect.Width, rect.Height, flags);
             ApplyNativeDragRegions();

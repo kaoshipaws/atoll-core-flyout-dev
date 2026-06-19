@@ -20,6 +20,7 @@ using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Media.Animation;
 using Windows.Win32.UI.WindowsAndMessaging;
 #elif WASDK
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Hosting;
@@ -45,6 +46,8 @@ namespace DesktopFlyouts
     {
         private const double IslandSpacing = 12.0D;
         private const double IslandShadowMargin = 12.0D;
+        // DEBUG: 5000 ms for slow-motion testing. Restore to 300 ms before shipping.
+        private static readonly TimeSpan IslandResizeAnimationDuration = TimeSpan.FromMilliseconds(300);
         private const double SwipeDismissDragStartThreshold = 4.0D;
         private const double SwipeDismissAxisDominanceRatio = 1.2D;
         private static readonly Thickness s_islandShadowMargin = new(IslandShadowMargin);
@@ -58,6 +61,11 @@ namespace DesktopFlyouts
         private readonly Dictionary<DesktopFlyoutIsland, Storyboard> _pressedScaleStoryboards = [];
         private readonly Dictionary<Storyboard, (DesktopFlyoutIsland Island, double TargetScale)> _pressedScaleStoryboardStates = [];
         private readonly HashSet<DesktopFlyoutIsland> _pressedScaleIslands = [];
+        private readonly Dictionary<DesktopFlyoutIsland, IslandResizeAnimation> _islandHeightAnimations = [];
+        private readonly Dictionary<DesktopFlyoutIsland, IslandResizeAnimation> _islandWidthAnimations = [];
+        private bool _islandResizeRenderingSubscribed;
+        private bool _islandResizeLayoutPending;
+        private TimeSpan _lastIslandResizeRenderingTime;
         private bool _isPopupAnimationPlaying;
         private bool _isSwipeDismissTracking;
         private bool _isSwipeDismissDragging;
@@ -207,10 +215,35 @@ namespace DesktopFlyouts
         }
 #endif
 
+        // Pending flag for coalescing rapid IslandHeight/Width changes (e.g. during animation)
+        // into a single UpdateOpenFlyoutLayout call per dispatcher frame.
+        private bool _islandSizeChangePending;
+
         internal void OnIslandSizeChanged()
         {
+            // During resize animation the Rendering handler drives UpdateOpenFlyoutLayout()
+            // synchronously each frame. Skip the async queue AND the expensive UpdateIslands()
+            // work (EnsureIslandHosts / drag-region rebuild) since island membership does not
+            // change during animation.
+            if (_islandResizeRenderingSubscribed)
+                return;
+
             UpdateIslands();
+
+            if (_islandSizeChangePending)
+                return;
+
+            _islandSizeChangePending = true;
+#if WASDK
+            DispatcherQueue.TryEnqueue(DispatcherQueuePriority.High, () =>
+            {
+                UpdateOpenFlyoutLayout(); // _islandSizeChangePending still true → SWP_ASYNCWINDOWPOS
+                _islandSizeChangePending = false;
+            });
+#else
+            _islandSizeChangePending = false;
             UpdateOpenFlyoutLayout();
+#endif
         }
 
         internal void OnIslandPositionChanged(DesktopFlyoutIsland island)
@@ -318,6 +351,7 @@ namespace DesktopFlyouts
             StopRestoreActivationTimer();
             StopLostFocusCloseTimer();
             StopSwipeDismissRestoreStoryboard();
+            StopIslandResizeAnimations();
             ReleaseCapturedPointers();
             ResetSwipeDismissTracking();
             _lastAnchorPoint = null;
@@ -526,7 +560,7 @@ namespace DesktopFlyouts
                     islandHeight + shadowTop + shadowBottom);
 
                 item.Value.SetContentMargin(islandShadowMargin);
-                item.Value.MoveAndResize(hostRect, ShouldActivateOnOpen());
+                item.Value.MoveAndResize(hostRect, ShouldActivateOnOpen(), async: _islandSizeChangePending);
                 item.Value.SetHWndRectRegion(new(0, 0, hostRect.Width, hostRect.Height));
             }
 
@@ -1471,6 +1505,177 @@ namespace DesktopFlyouts
                 _pressedScaleIslands.Remove(state.Island);
         }
 
+        // Single-field record: From/To are IslandHeight/IslandWidth values (the source of truth
+        // for window position). The window moves every frame via UpdateOpenFlyoutLayout().
+        private readonly record struct IslandResizeAnimation(double From, double To, DateTimeOffset StartTime);
+
+        /// <summary>
+        /// Animates the height of <paramref name="island"/> to <paramref name="toValue"/>.
+        /// <see cref="DesktopFlyoutIsland.IslandHeight"/> is updated each frame so the host window follows along;
+        /// for BottomToTop flyouts the bottom edge stays fixed because <see cref="UpdateFlyoutRegion"/>
+        /// always anchors the window to <c>workArea.Bottom</c>.
+        /// </summary>
+        /// <param name="island">The island whose height to animate.</param>
+        /// <param name="toValue">The target height in device-independent pixels.</param>
+        /// <param name="instant">When <see langword="true"/>, applies the new height without animation.</param>
+        public void AnimateIslandHeight(DesktopFlyoutIsland island, double toValue, bool instant = false)
+        {
+            var fromValue = island.IslandHeight.IsAbsolute && island.IslandHeight.Value > 0
+                ? island.IslandHeight.Value
+                : island.ActualHeight > 0
+                    ? island.ActualHeight
+                    : toValue;
+
+            StopIslandResizeHeightAnimation(island);
+
+            if (instant || !IsTransitionAnimationEnabled || Math.Abs(fromValue - toValue) < 1)
+            {
+                island.IslandHeight = new GridLength(toValue);
+                UpdateOpenFlyoutLayout();
+                return;
+            }
+
+            _islandHeightAnimations[island] = new(fromValue, toValue, DateTimeOffset.Now);
+            EnsureIslandResizeRenderingSubscribed();
+        }
+
+        /// <summary>
+        /// Animates the width of <paramref name="island"/> to <paramref name="toValue"/>.
+        /// </summary>
+        /// <param name="island">The island whose width to animate.</param>
+        /// <param name="toValue">The target width in device-independent pixels.</param>
+        /// <param name="instant">When <see langword="true"/>, applies the new width without animation.</param>
+        public void AnimateIslandWidth(DesktopFlyoutIsland island, double toValue, bool instant = false)
+        {
+            var fromValue = island.IslandWidth.IsAbsolute && island.IslandWidth.Value > 0
+                ? island.IslandWidth.Value
+                : island.ActualWidth > 0
+                    ? island.ActualWidth
+                    : toValue;
+
+            StopIslandResizeWidthAnimation(island);
+
+            if (instant || !IsTransitionAnimationEnabled || Math.Abs(fromValue - toValue) < 1)
+            {
+                island.IslandWidth = new GridLength(toValue);
+                UpdateOpenFlyoutLayout();
+                return;
+            }
+
+            _islandWidthAnimations[island] = new(fromValue, toValue, DateTimeOffset.Now);
+            EnsureIslandResizeRenderingSubscribed();
+        }
+
+        private void StopIslandResizeHeightAnimation(DesktopFlyoutIsland island)
+        {
+            if (!_islandHeightAnimations.Remove(island, out var anim))
+                return;
+
+            // Set the final IslandHeight and reposition the window directly since
+            // OnIslandSizeChanged's async queue is suppressed while the Rendering hook is live.
+            island.IslandHeight = new GridLength(anim.To);
+            UpdateOpenFlyoutLayout();
+        }
+
+        private void StopIslandResizeWidthAnimation(DesktopFlyoutIsland island)
+        {
+            if (!_islandWidthAnimations.Remove(island, out var anim))
+                return;
+
+            island.IslandWidth = new GridLength(anim.To);
+            UpdateOpenFlyoutLayout();
+        }
+
+        private void StopIslandResizeAnimations()
+        {
+            List<DesktopFlyoutIsland> heightIslands = [.. _islandHeightAnimations.Keys];
+            List<DesktopFlyoutIsland> widthIslands = [.. _islandWidthAnimations.Keys];
+            foreach (var island in heightIslands)
+                StopIslandResizeHeightAnimation(island);
+            foreach (var island in widthIslands)
+                StopIslandResizeWidthAnimation(island);
+            UnsubscribeIslandResizeRendering();
+        }
+
+        private void EnsureIslandResizeRenderingSubscribed()
+        {
+            if (!_islandResizeRenderingSubscribed)
+            {
+                _islandResizeRenderingSubscribed = true;
+                CompositionTarget.Rendering += OnIslandResizeRendering;
+            }
+        }
+
+        private void UnsubscribeIslandResizeRendering()
+        {
+            if (_islandResizeRenderingSubscribed)
+            {
+                CompositionTarget.Rendering -= OnIslandResizeRendering;
+                _islandResizeRenderingSubscribed = false;
+            }
+        }
+
+        private void OnIslandResizeRendering(object? sender, object e)
+        {
+            // Skip duplicate callbacks that fire for the same vsync tick.
+            // CompositionTarget.Rendering can fire more than once per physical frame
+            // when multiple XAML roots are present or when the compositor batches extra passes.
+            var renderingTime = (e as RenderingEventArgs)?.RenderingTime ?? TimeSpan.Zero;
+            if (renderingTime != TimeSpan.Zero && renderingTime == _lastIslandResizeRenderingTime)
+                return;
+            _lastIslandResizeRenderingTime = renderingTime;
+
+            // Update IslandHeight/IslandWidth for this tick. The actual window reposition
+            // (SetWindowPos + UpdateLayout) is queued as a High-priority dispatcher callback
+            // so it fires between frames — OUTSIDE this Rendering callback. This ensures
+            // SetWindowPos and the DComp visual commit land in the same DWM frame, avoiding
+            // the 1-frame composition mismatch that causes the flicker.
+            var now = DateTimeOffset.Now;
+            List<(DesktopFlyoutIsland Island, IslandResizeAnimation Anim)>? completed = null;
+
+            foreach (var (island, anim) in _islandHeightAnimations)
+            {
+                var t = Math.Min((now - anim.StartTime).TotalMilliseconds / IslandResizeAnimationDuration.TotalMilliseconds, 1.0);
+                island.IslandHeight = new GridLength(anim.From + (anim.To - anim.From) * (1.0 - Math.Pow(1.0 - t, 3.0)));
+                if (t >= 1.0) { completed ??= []; completed.Add((island, anim)); }
+            }
+
+            if (completed is not null)
+            {
+                foreach (var (island, _) in completed)
+                    _islandHeightAnimations.Remove(island);
+                completed = null;
+            }
+
+            foreach (var (island, anim) in _islandWidthAnimations)
+            {
+                var t = Math.Min((now - anim.StartTime).TotalMilliseconds / IslandResizeAnimationDuration.TotalMilliseconds, 1.0);
+                island.IslandWidth = new GridLength(anim.From + (anim.To - anim.From) * (1.0 - Math.Pow(1.0 - t, 3.0)));
+                if (t >= 1.0) { completed ??= []; completed.Add((island, anim)); }
+            }
+
+            if (completed is not null)
+            {
+                foreach (var (island, _) in completed)
+                    _islandWidthAnimations.Remove(island);
+            }
+
+            if (_islandHeightAnimations.Count == 0 && _islandWidthAnimations.Count == 0)
+                UnsubscribeIslandResizeRendering();
+
+            // Coalesce: at most one pending layout update per frame.
+            if (!_islandResizeLayoutPending)
+            {
+                _islandResizeLayoutPending = true;
+                DispatcherQueue.TryEnqueue(DispatcherQueuePriority.High, () =>
+                {
+                    _islandResizeLayoutPending = false;
+                    if (IsOpen)
+                        UpdateOpenFlyoutLayout();
+                });
+            }
+        }
+
         private bool IsPressedScaleEnabled()
         {
             return Math.Abs(GetResolvedPressedScale() - 1.0D) > 0.001D;
@@ -2027,6 +2232,7 @@ namespace DesktopFlyouts
             StopTransitionStoryboards();
             StopPressedScaleStoryboards();
             StopSwipeDismissRestoreStoryboard();
+            StopIslandResizeAnimations();
             ReleaseCapturedPointers();
             RestoreFocusSuppression();
 

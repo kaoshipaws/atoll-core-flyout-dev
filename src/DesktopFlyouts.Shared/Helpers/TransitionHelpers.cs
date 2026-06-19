@@ -119,6 +119,36 @@ namespace DesktopFlyouts
             return storyboard;
         }
 
+        /// <summary>
+        /// Returns a storyboard that animates a double island layout property (height or width)
+        /// from <paramref name="from"/> to <paramref name="to"/> using a cubic ease-out curve.
+        /// </summary>
+        internal static Storyboard GetIslandResizeStoryboard(DependencyObject target, string property, double from, double to)
+        {
+            var storyboard = new Storyboard();
+
+            var keyFrames = new DoubleAnimationUsingKeyFrames() { EnableDependentAnimation = true };
+            keyFrames.KeyFrames.Add(new DiscreteDoubleKeyFrame()
+            {
+                KeyTime = KeyTime.FromTimeSpan(TimeSpan.Zero),
+                Value = from,
+            });
+
+            keyFrames.KeyFrames.Add(new SplineDoubleKeyFrame()
+            {
+                KeySpline = new() { ControlPoint1 = new(0.1, 0.9), ControlPoint2 = new(0.4, 1.0) },
+                KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(300)),
+                Value = to,
+            });
+
+            Storyboard.SetTarget(keyFrames, target);
+            Storyboard.SetTargetProperty(keyFrames, property);
+
+            storyboard.Children.Add(keyFrames);
+
+            return storyboard;
+        }
+
         internal static Storyboard GetPressedScaleTransitionStoryboard(
             DependencyObject target,
             double fromScaleX,
